@@ -1,0 +1,193 @@
+import streamlit as st
+import numpy as np
+import cv2
+from PIL import Image
+from scipy.fft import fft
+from scipy.signal import find_peaks
+from sklearn.tree import DecisionTreeClassifier
+from transformers import pipeline
+
+# -------------------------------
+# 🔹 Load lightweight LLM (CPU-friendly)
+# -------------------------------
+@st.cache_resource
+def load_llm():
+    return pipeline("text-generation", model="distilgpt2")
+
+llm = load_llm()
+
+# -------------------------------
+# 🔹 Image → Signal Extraction
+# -------------------------------
+def extract_signal_from_image(uploaded_image):
+    image = Image.open(uploaded_image).convert("L")
+    img = np.array(image)
+
+    # Resize for speed
+    img = cv2.resize(img, (400, 250))
+
+    # Noise reduction
+    img = cv2.GaussianBlur(img, (5, 5), 0)
+
+    # Edge detection
+    edges = cv2.Canny(img, 30, 100)
+
+    height, width = edges.shape
+    signal = []
+
+    for col in range(width):
+        rows = np.where(edges[:, col] > 0)[0]
+
+        if len(rows) > 0:
+            signal.append(np.mean(rows))
+        else:
+            signal.append(signal[-1] if signal else height / 2)
+
+    signal = np.array(signal)
+
+    # Normalize & invert
+    signal = height - signal
+    signal = (signal - np.min(signal)) / (np.max(signal) - np.min(signal))
+
+    t = np.linspace(0, 5, len(signal))
+
+    return t, signal
+
+
+# -------------------------------
+# 🔹 Feature Extraction
+# -------------------------------
+def extract_features(signal, t):
+    peaks, _ = find_peaks(signal)
+    peak_vals = signal[peaks]
+
+    if len(peak_vals) < 2:
+        return None
+
+    log_dec = np.log(peak_vals[0] / peak_vals[1])
+    zeta_est = log_dec / np.sqrt((2 * np.pi)**2 + log_dec**2)
+
+    fft_vals = np.abs(fft(signal))
+    freqs = np.fft.fftfreq(len(signal), t[1] - t[0])
+    freq = abs(freqs[np.argmax(fft_vals)])
+
+    decay = "Exponential" if np.all(np.diff(np.log(np.abs(signal)+1e-5)) < 0) else "Non-exponential"
+
+    return zeta_est, log_dec, freq, decay
+
+
+# -------------------------------
+# 🔹 Generate Training Data
+# -------------------------------
+def generate_signal(zeta):
+    t = np.linspace(0, 5, 1000)
+    wn = 8
+    signal = np.exp(-zeta * wn * t) * np.cos(wn * np.sqrt(1 - zeta**2) * t)
+    return t, signal
+
+
+X = []
+y = []
+
+# Viscous damping
+for _ in range(20):
+    z = np.random.uniform(0.02, 0.15)
+    t, s = generate_signal(z)
+    feat = extract_features(s, t)
+    if feat:
+        X.append([feat[0], feat[2]])
+        y.append(0)
+
+# Structural damping
+for _ in range(20):
+    z = np.random.uniform(0.2, 0.4)
+    t, s = generate_signal(z)
+    feat = extract_features(s, t)
+    if feat:
+        X.append([feat[0], feat[2]])
+        y.append(1)
+
+model = DecisionTreeClassifier()
+model.fit(X, y)
+
+
+# -------------------------------
+# 🔹 LLM Explanation
+# -------------------------------
+def get_llm_explanation(zeta, log_dec, freq, decay, prediction):
+    prompt = f"""
+Damping ratio: {zeta}
+Log decrement: {log_dec}
+Frequency: {freq}
+Decay type: {decay}
+Predicted damping: {prediction}
+
+Explain the damping behavior in simple engineering terms.
+"""
+
+    response = llm(prompt, max_new_tokens=80, do_sample=False)
+    text = response[0]["generated_text"].replace(prompt, "").strip()
+
+    explanation = f"""
+[Observations]
+- Damping ratio = {zeta:.3f}
+
+[Interpretation]
+- The system shows {prediction.lower()} behavior
+
+[Frequency]
+- Dominant frequency ≈ {freq:.2f} Hz
+
+[Decay]
+- Signal follows {decay.lower()} decay
+
+[Recommendation]
+- Adjust damping parameters if required for stability
+"""
+    return explanation
+
+
+# -------------------------------
+# 🔹 Streamlit UI
+# -------------------------------
+st.title("Vibration Signal Damping Analyzer (Image Input)")
+
+uploaded_image = st.file_uploader(
+    "Upload vibration graph", type=["png", "jpg", "jpeg"]
+)
+
+if uploaded_image is not None:
+    st.image(uploaded_image, caption="Uploaded Graph", use_container_width=True)
+
+    # Extract signal
+    t, signal = extract_signal_from_image(uploaded_image)
+
+    st.subheader("Extracted Signal")
+    st.line_chart(signal)
+
+    if st.button("Analyze Signal"):
+        feat = extract_features(signal, t)
+
+        if feat:
+            zeta, log_dec, freq, decay = feat
+
+            pred = model.predict([[zeta, freq]])
+
+            result = "Viscous damping" if pred[0] == 0 else "Structural damping"
+
+            st.success(f"Predicted: {result}")
+
+            st.write(f"**Damping Ratio:** {zeta:.3f}")
+            st.write(f"**Log Decrement:** {log_dec:.3f}")
+            st.write(f"**Frequency:** {freq:.3f}")
+            st.write(f"**Decay Type:** {decay}")
+
+            explanation = get_llm_explanation(
+                zeta, log_dec, freq, decay, result
+            )
+
+            st.subheader("AI Explanation")
+            st.write(explanation)
+
+        else:
+            st.error("Feature extraction failed. Try a clearer image.")
